@@ -1,0 +1,1114 @@
+Directory structure:
+└── DirectSearch/
+    ├── main.py
+    ├── overlay.py
+    ├── requirements.txt
+    ├── core/
+    │   ├── __init__.py
+    │   ├── direct_search_engine.py
+    │   ├── image_search.py
+    │   └── ocr_processor.py
+    └── utils/
+        ├── hotkey_manager.py
+        ├── image_processing.py
+        └── system_integration.py
+
+================================================
+FILE: main.py
+================================================
+import sys
+import os
+import atexit
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter
+from PySide6.QtCore import QLockFile, QDir, Qt, QPoint
+
+class DirectSearchApplication:
+    """Main application controller with system tray"""
+    
+    def __init__(self, app: QApplication, start_minimized=False):
+        self.app = app
+        print("[DEBUG] Initializing Direct Search Application...")
+        
+        # Set up system tray
+        self.setup_system_tray()
+        
+        # Initialize core components as None (lazy loading)
+        self.search_engine = None
+        self.overlay = None
+        self.hotkey_manager = None
+        
+        # Start minimal hotkey listener (lightweight)
+        self.setup_minimal_hotkey_manager()
+        
+        if not start_minimized:
+            self.show_notification("Direct Search", "Application started! Press Ctrl+Shift+Space to capture.")
+        
+        print("[DEBUG] Direct Search Application initialized in low-memory mode!")
+
+    def setup_minimal_hotkey_manager(self):
+        """Setup minimal hotkey manager without loading heavy dependencies"""
+        try:
+            from utils.hotkey_manager import HotkeyManager
+            self.hotkey_manager = HotkeyManager()
+            self.hotkey_manager.hotkey_pressed.connect(self.handle_show_overlay)
+            self.hotkey_manager.start_listening()
+            print("[INFO] Minimal hotkey manager started")
+        except Exception as e:
+            print(f"[WARNING] Failed to setup hotkey manager: {e}")
+
+    def lazy_load_components(self):
+        """Lazy load heavy components only when needed"""
+        if self.search_engine is None:
+            print("[DEBUG] 🚀 Lazy loading core components...")
+            try:
+                from core.direct_search_engine import DirectSearchEngine
+                from overlay import OverlayWindow
+                
+                self.search_engine = DirectSearchEngine()
+                self.overlay = OverlayWindow()
+                
+                # Connect signals
+                self.overlay.region_selected.connect(self.on_region_selected)
+                print("[DEBUG] Core components loaded successfully")
+            except Exception as e:
+                print(f"[ERROR] Failed to load core components: {e}")
+                return False
+        return True
+
+    def create_default_icon(self):
+        """Create a default icon programmatically if no icon file exists"""
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw a simple search icon (magnifying glass)
+        painter.setBrush(Qt.blue)
+        painter.setPen(Qt.darkBlue)
+        painter.drawEllipse(8, 8, 48, 48)  # Outer circle
+        
+        painter.setBrush(Qt.white)
+        painter.drawEllipse(16, 16, 32, 32)  # Inner circle
+        
+        # Draw handle (simplified - just a rectangle)
+        painter.setBrush(Qt.blue)
+        painter.drawRect(40, 40, 20, 8)  # Simple handle
+        
+        painter.end()
+        return QIcon(pixmap)
+
+    def setup_system_tray(self):
+        """Setup system tray icon and menu"""
+        # Create tray icon
+        self.tray_icon = QSystemTrayIcon()
+        
+        # Try to load custom icon, fallback to default
+        icon_path = self.get_icon_path()
+        if os.path.exists(icon_path):
+            self.tray_icon.setIcon(QIcon(icon_path))
+            print(f"[INFO] Loaded icon from: {icon_path}")
+        else:
+            # Create a default icon programmatically
+            print("[INFO] No icon file found, creating default icon")
+            default_icon = self.create_default_icon()
+            self.tray_icon.setIcon(default_icon)
+        
+        # Create context menu
+        tray_menu = QMenu()
+        
+        # Show overlay action
+        show_action = QAction("📷 Capture Screen", self.app)
+        show_action.triggered.connect(self.handle_show_overlay)
+        tray_menu.addAction(show_action)
+        
+        # Separator
+        tray_menu.addSeparator()
+        
+        # Exit action
+        exit_action = QAction("❌ Exit", self.app)
+        exit_action.triggered.connect(self.cleanup_and_exit)
+        tray_menu.addAction(exit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.setToolTip("Direct Search\nPress Ctrl+Shift+Space to capture")
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def get_icon_path(self):
+        """Get path to application icon"""
+        # Check multiple possible locations
+        possible_paths = [
+            # Development paths
+            os.path.join(os.path.dirname(__file__), 'assets', 'tray_icon.ico'),
+            os.path.join(os.path.dirname(__file__), 'assets', 'icon.ico'),
+            os.path.join(os.path.dirname(__file__), 'tray_icon.ico'),
+            os.path.join(os.path.dirname(__file__), 'icon.ico'),
+            # For PyInstaller - look in the same directory as executable
+            os.path.join(os.path.dirname(sys.executable), 'tray_icon.ico'),
+            os.path.join(os.path.dirname(sys.executable), 'icon.ico'),
+        ]
+        
+        # For PyInstaller bundled app
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+            possible_paths.extend([
+                os.path.join(base_path, 'assets', 'tray_icon.ico'),
+                os.path.join(base_path, 'assets', 'icon.ico'),
+                os.path.join(base_path, 'tray_icon.ico'),
+                os.path.join(base_path, 'icon.ico'),
+            ])
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        
+        return ""
+
+    def on_tray_activated(self, reason):
+        """Handle tray icon clicks"""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.handle_show_overlay()
+
+    def show_notification(self, title, message):
+        """Show system tray notification"""
+        self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 3000)
+
+    def handle_show_overlay(self):
+        """Show the capture overlay with lazy loading"""
+        print("[DEBUG] 🎯 Activating overlay with lazy loading...")
+        try:
+            # Lazy load components first
+            if not self.lazy_load_components():
+                self.show_notification("Error", "Failed to load application components")
+                return
+                
+            self.overlay.show_overlay()
+            print("[DEBUG] Overlay activated")
+        except Exception as e:
+            print(f"[ERROR] Failed to show overlay: {e}")
+            self.show_notification("Error", "Failed to show overlay")
+
+    def on_region_selected(self, rect):
+        """Handle region selection with direct search"""
+        print(f"[DEBUG] Region selected: {rect}")
+        if self.search_engine:
+            self.search_engine.process_selection(rect)
+        else:
+            print("[ERROR] Search engine not initialized")
+
+    def cleanup_and_exit(self):
+        """Cleanup and exit application"""
+        self.cleanup()
+        self.app.quit()
+
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.search_engine:
+            self.search_engine.cleanup()
+        if self.hotkey_manager:
+            self.hotkey_manager.stop_listening()
+
+
+# Follwing code is for develoment phase - inevitablegs
+
+        
+def main():
+    print("🚀 Starting Direct Search Application (Lazy Load Mode)")
+    
+    # Single instance lock
+    lock_file = QLockFile(os.path.join(QDir.tempPath(), "direct-search-app.lock"))
+    if not lock_file.tryLock(100):
+        print("[ERROR] Another instance is already running.")
+        sys.exit(0)
+    
+    # Check for minimized start
+    start_minimized = "--minimized" in sys.argv or "/minimized" in sys.argv
+    
+    # Create application
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("Direct Search")
+    app.setApplicationDisplayName("Direct Search")
+
+    # Create main controller with lazy loading
+    main_controller = DirectSearchApplication(app, start_minimized=start_minimized)
+
+    print("✨ Direct Search Application is ready!")
+    print("📖 Running in background with minimal memory...")
+    print("   🎯 Press Ctrl+Shift+Space to capture")
+    print("   📌 Double-click tray icon to capture") 
+    print("   ❌ Right-click tray icon to exit")
+    print("   💾 Memory: Lightweight mode (heavy components load on demand)")
+    
+    # Ensure cleanup on exit
+    atexit.register(main_controller.cleanup)
+
+    # Start the application
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: overlay.py
+================================================
+from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import Qt, QRect, QPoint, Signal
+from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+
+class OverlayWindow(QWidget):
+    region_selected = Signal(QRect)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        self.begin_pos = QPoint()
+        self.end_pos = QPoint()
+        self.is_selecting = False
+
+    def show_overlay(self):
+        """Shows the simplified overlay across all screens."""
+        desktop_geometry = self.get_desktop_geometry()
+        self.setGeometry(desktop_geometry)
+        self.showFullScreen()
+        self.activateWindow()
+
+    def get_desktop_geometry(self) -> QRect:
+        """Calculates the bounding box of all connected screens."""
+        total_geometry = QRect()
+        for screen in QGuiApplication.screens():
+            total_geometry = total_geometry.united(screen.geometry())
+        return total_geometry
+
+    def paintEvent(self, event):
+        """A much simpler paint event for debugging."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 1. Draw a semi-transparent black overlay over the entire screen area.
+        overlay_color = QColor(0, 0, 0, 80)
+        painter.fillRect(self.rect(), overlay_color)
+
+        # 2. If selecting, draw a border for the selection rectangle.
+        if self.is_selecting:
+            selection_rect = QRect(self.begin_pos, self.end_pos).normalized()
+            
+            # Draw a clear rectangle inside the selection
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(selection_rect, Qt.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+            # Draw a white border around it
+            pen = QPen(QColor("#FFFFFF"), 2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(selection_rect)
+
+    def mousePressEvent(self, event):
+        self.is_selecting = True
+        self.begin_pos = event.position().toPoint()
+        self.end_pos = self.begin_pos
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.is_selecting:
+            self.end_pos = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.is_selecting:
+            self.is_selecting = False
+            selection_rect = QRect(self.begin_pos, self.end_pos).normalized()
+            self.hide()
+            
+            if selection_rect.width() > 5 and selection_rect.height() > 5:
+                self.region_selected.emit(selection_rect)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.is_selecting = False
+            self.hide()
+
+
+================================================
+FILE: requirements.txt
+================================================
+# Core GUI Framework
+PySide6>=6.5.0
+
+# Screen Capture
+mss>=9.0.1
+
+# OCR Processing
+easyocr>=1.7.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image Processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Web Automation for direct image search
+selenium>=4.10.0
+webdriver-manager>=4.0.0
+
+# Clipboard Operations
+pyperclip>=1.8.2
+
+# Global Hotkeys
+pynput>=1.7.6
+
+# Optional: Windows clipboard support (if pyperclip fails)
+# pywin32>=306; sys_platform == 'win32'
+
+# Add these as alternatives to Selenium
+pyautogui>=0.9.54  # For keyboard automation as fallback
+pygetwindow>=0.0.9  # For window management
+
+
+================================================
+FILE: core/__init__.py
+================================================
+# Core package initialization
+
+
+================================================
+FILE: core/direct_search_engine.py
+================================================
+import os
+import tempfile
+import pyperclip
+import webbrowser
+import mss
+from urllib.parse import quote_plus
+from PIL import Image
+from PySide6.QtCore import QRect, QThread, Signal
+from PySide6.QtGui import QGuiApplication
+
+from core.ocr_processor import OCRProcessor
+from core.image_search import DirectImageSearchHandler
+
+class SearchWorker(QThread):
+    """Worker thread for processing search operations"""
+    finished = Signal(bool, str)
+    
+    def __init__(self, search_engine, rect, image=None, text=None):
+        super().__init__()
+        self.search_engine = search_engine
+        self.rect = rect
+        self.image = image
+        self.text = text
+
+    def run(self):
+        """Run search operation in thread"""
+        try:
+            if self.text:
+                success = self.search_engine.search_text(self.text)
+                self.finished.emit(success, f"Text search: {self.text[:30]}...")
+            elif self.image:
+                success = self.search_engine.search_image(self.image)
+                self.finished.emit(success, "Direct image search")
+            else:
+                self.finished.emit(False, "No content to search")
+        except Exception as e:
+            print(f"[ERROR] Search worker error: {e}")
+            self.finished.emit(False, f"Error: {str(e)}")
+
+class DirectSearchEngine:
+    """Main search engine handling both text and direct image search"""
+    
+    def __init__(self):
+        self.ocr_processor = None  # Lazy initialization
+        self.image_handler = None  # Lazy initialization
+        self.current_worker = None
+
+    def _initialize_ocr(self):
+        """Initialize OCR processor only when needed"""
+        if self.ocr_processor is None:
+            self.ocr_processor = OCRProcessor()
+
+    def _initialize_image_handler(self):
+        """Initialize image handler only when needed"""
+        if self.image_handler is None:
+            self.image_handler = DirectImageSearchHandler()
+
+    def capture_region(self, rect: QRect):
+        """Capture screen region and return PIL Image"""
+        try:
+            screen = QGuiApplication.primaryScreen()
+            pixel_ratio = screen.devicePixelRatio()
+            
+            capture_rect = {
+                "top": int(rect.top() * pixel_ratio),
+                "left": int(rect.left() * pixel_ratio),
+                "width": int(rect.width() * pixel_ratio),
+                "height": int(rect.height() * pixel_ratio),
+            }
+            
+            with mss.mss() as sct:
+                sct_img = sct.grab(capture_rect)
+                pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                return pil_img
+                
+        except Exception as e:
+            print(f"[ERROR] Screen capture failed: {e}")
+            return None
+
+    def process_selection(self, rect: QRect):
+        """Process selected region for search"""
+        print("[INFO] Processing selected region...")
+        
+        # Capture image
+        captured_image = self.capture_region(rect)
+        if not captured_image:
+            print("[ERROR] Failed to capture region")
+            return
+
+        # Initialize OCR only when needed
+        self._initialize_ocr()
+        
+        # Perform OCR
+        ocr_text = self.ocr_processor.extract_text(captured_image)
+        
+        # Auto-copy text to clipboard
+        if ocr_text.strip():
+            try:
+                pyperclip.copy(ocr_text.strip())
+                print("[INFO] Text copied to clipboard")
+            except Exception as e:
+                print(f"[WARNING] Could not copy text: {e}")
+
+        # Determine search type and execute
+        if ocr_text.strip():
+            print(f"[INFO] 🔍 Performing text search: {ocr_text[:40]}...")
+            self._start_search_worker(rect, text=ocr_text.strip())
+        else:
+            print("[INFO] 🚀 Performing direct image search...")
+            # Initialize image handler only when needed
+            self._initialize_image_handler()
+            self._start_search_worker(rect, image=captured_image)
+
+    def _start_search_worker(self, rect, image=None, text=None):
+        """Start search in worker thread"""
+        if self.current_worker and self.current_worker.isRunning():
+            self.current_worker.quit()
+            self.current_worker.wait()
+            
+        self.current_worker = SearchWorker(self, rect, image, text)
+        self.current_worker.finished.connect(self._on_search_complete)
+        self.current_worker.start()
+
+    def _on_search_complete(self, success, message):
+        """Handle search completion"""
+        if success:
+            print(f"✅ {message} completed successfully!")
+        else:
+            print(f"❌ {message} failed")
+
+    def search_text(self, query):
+        """Search text with Google"""
+        if not query.strip():
+            return False
+        
+        try:
+            clean_query = query.strip()
+            encoded_query = quote_plus(clean_query)
+            url = f"https://www.google.com/search?q={encoded_query}"
+            webbrowser.open(url)
+            print(f"[INFO] 🔍 Google text search: '{clean_query[:50]}{'...' if len(clean_query) > 50 else ''}'")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Text search failed: {e}")
+            return False
+
+    def search_image(self, pil_image):
+        """Perform direct reverse image search"""
+        if pil_image:
+            print("🚀 Starting direct image search...")
+            return self.image_handler.perform_direct_image_search(pil_image)
+        else:
+            print("[WARNING] No image provided for reverse search")
+            return False
+
+    def cleanup(self):
+        """Cleanup resources and free memory - ONLY on app exit"""
+        if self.ocr_processor:
+            self.ocr_processor.cleanup()
+        # Don't cleanup image_handler here - let browser stay open
+        # if self.image_handler:
+        #     self.image_handler.cleanup()
+        if self.current_worker and self.current_worker.isRunning():
+            self.current_worker.quit()
+            self.current_worker.wait()
+
+
+================================================
+FILE: core/image_search.py
+================================================
+import os
+import tempfile
+import time
+import webbrowser
+from PIL import Image
+import threading
+import sys
+
+# Selenium imports for direct image search
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service as ChromeService
+
+class DirectImageSearchHandler:
+    """Handles DIRECT image search with automatic upload to Google Images/Lens"""
+    
+    def __init__(self):
+        self.temp_dir = tempfile.gettempdir()
+        self.driver = None
+        self.selenium_available = self._check_selenium()
+    
+    def _check_selenium(self):
+        """Check if Selenium is available"""
+        try:
+            from selenium import webdriver
+            return True
+        except ImportError:
+            print("[WARNING] Selenium not available - direct image search disabled")
+            return False
+    
+    def _close_driver(self):
+        """Helper to safely close the driver."""
+        if self.driver:
+            try:
+                self.driver.quit()
+                self.driver = None
+            except:
+                pass
+
+    def perform_direct_image_search(self, pil_image: Image.Image):
+        """
+        Robust DIRECT image upload using Google Lens, automatically clicks search button
+        """
+        
+        temp_image_path = self._save_temp_image(pil_image)
+        print(f"📁 Image saved to: {temp_image_path}")
+        
+        if not self.selenium_available:
+            print("[ERROR] Selenium not available. Falling back to manual method.")
+            return self._fallback_image_search(pil_image)
+
+        if not self._setup_driver():
+            print("[ERROR] Failed to set up browser driver. Falling back.")
+            return self._fallback_image_search(pil_image)
+
+        try:
+            print("🌐 Navigating to Google Lens...")
+            self.driver.get("https://lens.google.com")
+            
+            # Wait for page to load
+            time.sleep(2)
+            
+            # --- Robust File Upload Logic ---
+            
+            # 1. Locate the file input element (it is usually hidden)
+            print("🔍 Searching for file upload input...")
+            file_input = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
+            )
+            
+            # Ensure the input has a unique ID for JS manipulation
+            input_id = "direct_search_upload_input"
+            self.driver.execute_script(f"arguments[0].id = '{input_id}';", file_input)
+
+            print("📤 Sending file path to input...")
+            # 2. Send the file path
+            file_input.send_keys(temp_image_path)
+            
+            # Wait for upload to complete and upload button to appear
+            print("⏳ Waiting for upload to complete...")
+            time.sleep(3)
+            
+            # 3. Look for and click the search button
+            print("🔍 Looking for search button...")
+            
+            # Try multiple possible selectors for the search button
+            search_button_selectors = [
+                # Google Lens specific buttons
+                "button[aria-label*='Search']",
+                "button[jsname*='search']",
+                "button:has(svg)",  # Button with icon
+                "div[role='button'][aria-label*='Search']",
+                "div[jsname*='search']",
+                # Generic button with search text
+                "button:contains('Search')",
+                "button:contains('Search with image')",
+                "button:contains('Search image')",
+                # By class names that might indicate search button
+                "button[class*='search']",
+                "button[class*='submit']",
+                "button[class*='upload']",
+                # Google Images specific
+                "button[aria-label='Search']",
+                "button[data-attrid*='search']",
+            ]
+            
+            search_button = None
+            for selector in search_button_selectors:
+                try:
+                    if "contains" in selector:
+                        # Handle :contains pseudo-selector
+                        text = selector.split("contains('")[1].split("')")[0]
+                        buttons = self.driver.find_elements(By.TAG_NAME, "button")
+                        for btn in buttons:
+                            if text.lower() in btn.text.lower():
+                                search_button = btn
+                                break
+                    else:
+                        search_button = WebDriverWait(self.driver, 5).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                    
+                    if search_button:
+                        print(f"✅ Found search button with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not search_button:
+                # Try finding by XPath as fallback
+                try:
+                    search_button = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, 
+                            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'search')] | "
+                            "//div[@role='button' and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'search')]"
+                        ))
+                    )
+                except:
+                    pass
+            
+            if search_button:
+                print("🎯 Clicking search button automatically...")
+                try:
+                    # Try clicking with JavaScript if normal click fails
+                    self.driver.execute_script("arguments[0].click();", search_button)
+                    print("✅ Search button clicked via JavaScript")
+                except Exception as e:
+                    print(f"⚠️ JavaScript click failed: {e}")
+                    try:
+                        search_button.click()
+                        print("✅ Search button clicked normally")
+                    except Exception as e2:
+                        print(f"⚠️ Normal click also failed: {e2}")
+            else:
+                print("⚠️ Could not find search button, trying to trigger search with Enter key...")
+                # Try pressing Enter key as fallback
+                from selenium.webdriver.common.keys import Keys
+                file_input.send_keys(Keys.ENTER)
+                print("✅ Sent Enter key to trigger search")
+            
+            # Wait for search to complete
+            time.sleep(2)
+            
+            # --- Wait for Results ---
+            
+            # Wait for the URL to change to the results page (/lens/search/).
+            print("⏳ Waiting for search results (URL change to /lens/search)...")
+            
+            WebDriverWait(self.driver, 30).until(
+                EC.url_contains('/lens/search')
+            )
+            
+            # Now wait briefly for the content structure to confirm full page load
+            try:
+                search_results_selector = By.CSS_SELECTOR, "#rcnt, .tS4Oec, .GorPzc, .F8EnNe"
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located(search_results_selector)
+                )
+            except TimeoutException:
+                 print("⚠️ URL changed successfully, but result container took longer to render.")
+
+            print("✅ Search completed and results loaded successfully!")
+            print("📖 Browser will stay open - close manually when done")
+            return True
+
+        except TimeoutException:
+            print("❌ Timeout: Search results did not load in time. Check the browser window.")
+            # Try manual fallback in the browser
+            self._show_manual_instructions(temp_image_path)
+            return False
+        except Exception as e:
+            print(f"❌ Automated search failed: {e}")
+            self._close_driver()
+            return self._fallback_image_search(pil_image)
+    
+    def _show_manual_instructions(self, image_path):
+        """Show instructions for manual search if automated fails"""
+        print("\n" + "="*60)
+        print("🔧 MANUAL SEARCH INSTRUCTIONS:")
+        print("="*60)
+        print("1. Browser window is open to Google Lens")
+        print(f"2. Image saved at: {image_path}")
+        print("3. Drag and drop the image file into the browser")
+        print("4. Click the search button manually")
+        print("="*60 + "\n")
+    
+    def _setup_driver(self):
+        """Setup Chrome driver with better compatibility"""
+        try:
+            from selenium.webdriver.chrome.options import Options as ChromeOptions
+            
+            chrome_options = ChromeOptions()
+            
+            # Essential arguments
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            
+            # Make it look more like a real browser
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            # User agent to appear as regular Chrome
+            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            
+            # Disable automation flags
+            prefs = {
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            
+            # Try multiple driver initialization methods
+            try:
+                # Method 1: Use webdriver-manager
+                from selenium.webdriver.chrome.service import Service
+                from webdriver_manager.chrome import ChromeDriverManager
+                service = Service(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                
+            except Exception as e:
+                print(f"[INFO] Webdriver-manager failed, trying system Chrome: {e}")
+                # Method 2: Use system Chrome
+                try:
+                    self.driver = webdriver.Chrome(options=chrome_options)
+                except Exception as e2:
+                    print(f"[INFO] System Chrome failed: {e2}")
+                    # Method 3: Try Firefox as fallback
+                    try:
+                        from selenium import webdriver as firefox_driver
+                        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+                        firefox_options = FirefoxOptions()
+                        self.driver = firefox_driver.Firefox(options=firefox_options)
+                    except:
+                        return False
+            
+            # Hide automation indicators
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            # Set reasonable timeouts
+            self.driver.set_page_load_timeout(20)
+            self.driver.implicitly_wait(5)
+            
+            print("[INFO] Browser driver initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] Driver setup failed completely: {e}")
+            return False
+            
+    def _get_safe_temp_dir(self):
+        """Get a safe temp directory that works in .exe"""
+        if getattr(sys, 'frozen', False):
+            # Running as .exe - use user's temp directory
+            return os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
+        else:
+            # Running as script
+            return tempfile.gettempdir()
+        
+    def _save_temp_image(self, pil_image: Image.Image):
+        """Save image to temporary file"""
+        temp_dir = self._get_safe_temp_dir()
+        temp_path = os.path.join(temp_dir, f"search_image_{int(time.time())}.jpg")
+        
+        # Optimize image
+        img = pil_image.copy()
+        max_size = (1200, 800)
+        if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        img.save(temp_path, "JPEG", quality=85)
+        return temp_path
+    
+    def _fallback_image_search(self, pil_image: Image.Image):
+        """Fallback method when direct upload fails"""
+        try:
+            # Save to temp for manual upload
+            temp_dir = self._get_safe_temp_dir()
+            image_path = os.path.join(temp_dir, "search_image.jpg")
+            pil_image.save(image_path, "JPEG", quality=90)
+            
+            # Open Google Lens with instructions
+            webbrowser.open("https://lens.google.com")
+            
+            print("📁 Image saved for manual upload:")
+            print(f"   📍 Location: {image_path}")
+            print("   🌐 Google Lens opened - drag and drop the image file")
+            print("   🎯 Click the search button manually")
+            print("   📖 Close the browser manually when done searching")
+            
+            return True
+        except Exception as e:
+            print(f"❌ Fallback method failed: {e}")
+            # Last resort - just open Google Lens
+            webbrowser.open("https://lens.google.com")
+            return False
+    
+    def cleanup(self):
+        """Clean up browser driver and temp images"""
+        self._close_driver()
+        
+        # Clean temp files at exit
+        if hasattr(self, "temp_files"):
+            for f in self.temp_files:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+            self.temp_files.clear()
+            print("[INFO] Temporary images cleaned up")
+
+
+================================================
+FILE: core/ocr_processor.py
+================================================
+import easyocr
+import numpy
+from PIL import Image
+
+class OCRProcessor:
+    """Handles OCR text extraction from images with memory optimization"""
+    
+    def __init__(self):
+        self.reader = None
+        
+    def _initialize_reader(self):
+        """Initialize EasyOCR reader only when needed"""
+        if self.reader is None:
+            print("[INFO] Initializing EasyOCR Reader...")
+            # Use CPU only to save memory and avoid GPU issues
+            self.reader = easyocr.Reader(['en'], gpu=False)
+            print("[INFO] EasyOCR Reader initialized.")
+    
+    def extract_text(self, pil_image: Image.Image):
+        """Extract text from PIL Image using OCR"""
+        self._initialize_reader()
+        
+        try:
+            # Convert to numpy array
+            image_np = numpy.array(pil_image)
+            
+            # Perform OCR with confidence threshold
+            result = self.reader.readtext(image_np)
+            
+            # Filter results by confidence
+            recognized_texts = [text for bbox, text, conf in result if conf > 0.3]
+            full_text = "\n".join(recognized_texts)
+            
+            print(f"[INFO] OCR extracted {len(recognized_texts)} text elements")
+            
+            # Clear large variables
+            del image_np
+            del result
+            
+            return full_text
+            
+        except Exception as e:
+            print(f"[ERROR] OCR processing failed: {e}")
+            return ""
+    
+    def cleanup(self):
+        """Cleanup OCR reader to free memory"""
+        if self.reader:
+            try:
+                del self.reader
+                self.reader = None
+                print("[INFO] OCR reader cleaned up")
+            except:
+                pass
+
+
+================================================
+FILE: utils/hotkey_manager.py
+================================================
+import threading
+import time
+from PySide6.QtCore import QObject, Signal
+
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+    print("[WARNING] pynput not available, hotkeys disabled")
+
+class GlobalHotkeyListener(QObject):
+    """Global hotkey listener using pynput for system-wide shortcuts"""
+    hotkey_pressed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.active = False
+        self.listener = None
+
+    def start_listening(self):
+        """Start global hotkey listening"""
+        if not PYNPUT_AVAILABLE:
+            print("[ERROR] pynput not available for global hotkeys")
+            return False
+            
+        if self.active:
+            return True
+            
+        try:
+            self.active = True
+            listener_thread = threading.Thread(target=self._run_listener, daemon=True)
+            listener_thread.start()
+            print("[INFO] âœ… Global hotkeys started: Ctrl+Shift+Space")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to start global hotkeys: {e}")
+            return False
+
+    def _run_listener(self):
+        """Run the global hotkey listener"""
+        try:
+            with keyboard.GlobalHotKeys({
+                '<ctrl>+<shift>+<space>': self._on_hotkey,
+            }) as self.listener:
+                while self.active:
+                    time.sleep(0.1)
+        except Exception as e:
+            print(f"[ERROR] Hotkey listener error: {e}")
+
+    def _on_hotkey(self):
+        """Handle hotkey activation"""
+        if self.active:
+            print("[DEBUG] ðŸŽ¯ Global hotkey activated!")
+            self.hotkey_pressed.emit()
+
+    def stop_listening(self):
+        """Stop hotkey listening"""
+        self.active = False
+        if self.listener:
+            try:
+                self.listener.stop()
+            except:
+                pass
+
+class HotkeyManager(QObject):
+    """Manages hotkey functionality"""
+    
+    hotkey_pressed = Signal()
+    
+    def __init__(self):
+        super().__init__()
+        if PYNPUT_AVAILABLE:
+            self.listener = GlobalHotkeyListener()
+            self.listener.hotkey_pressed.connect(self.hotkey_pressed)
+        else:
+            print("[WARNING] Hotkeys disabled - pynput not available")
+    
+    def start_listening(self):
+        """Start hotkey listening"""
+        if PYNPUT_AVAILABLE:
+            return self.listener.start_listening()
+        return False
+    
+    def stop_listening(self):
+        """Stop hotkey listening"""
+        if PYNPUT_AVAILABLE:
+            self.listener.stop_listening()
+
+
+================================================
+FILE: utils/image_processing.py
+================================================
+from PIL import Image
+
+class ImageProcessor:
+    @staticmethod
+    def enhance_for_ocr(pil_image: Image.Image):
+        """Basic enhancement for OCR"""
+        return pil_image
+    
+    @staticmethod
+    def enhance_for_search(pil_image: Image.Image):
+        """Basic enhancement for search"""
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        return pil_image
+
+
+================================================
+FILE: utils/system_integration.py
+================================================
+import os
+import sys
+import winreg
+import ctypes
+from ctypes import wintypes
+
+class WindowsIntegration:
+    """Windows-specific system integration"""
+    
+    @staticmethod
+    def add_to_startup(app_path, app_name="DirectSearch"):
+        """Add application to Windows startup"""
+        try:
+            key = winreg.HKEY_CURRENT_USER
+            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            
+            with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
+                winreg.SetValueEx(reg_key, app_name, 0, winreg.REG_SZ, f'"{app_path}" --minimized')
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to add to startup: {e}")
+            return False
+    
+    @staticmethod
+    def remove_from_startup(app_name="DirectSearch"):
+        """Remove application from Windows startup"""
+        try:
+            key = winreg.HKEY_CURRENT_USER
+            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            
+            with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
+                winreg.DeleteValue(reg_key, app_name)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to remove from startup: {e}")
+            return False
+    
+    @staticmethod
+    def is_admin():
+        """Check if running as administrator"""
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin()
+        except:
+            return False
+
