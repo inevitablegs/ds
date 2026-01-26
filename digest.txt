@@ -22,6 +22,7 @@ import atexit
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter
 from PySide6.QtCore import QLockFile, QDir, Qt, QPoint
+import pyperclip # Needed here for copy-only action
 
 class DirectSearchApplication:
     """Main application controller with system tray"""
@@ -69,12 +70,23 @@ class DirectSearchApplication:
                 self.overlay = OverlayWindow()
                 
                 # Connect signals
+                # 1. Region selection (Image Search Mode)
                 self.overlay.region_selected.connect(self.on_region_selected)
+                
+                # 2. Text Selection Actions (New)
+                self.overlay.text_copied_and_searched.connect(self.on_text_search_copy)
+                self.overlay.text_copied.connect(self.on_text_copy) 
+
+                # 3. OCR results from Engine back to Overlay
+                self.search_engine.ocr_results_available.connect(self.overlay.load_ocr_results)
+                
                 print("[DEBUG] Core components loaded successfully")
             except Exception as e:
                 print(f"[ERROR] Failed to load core components: {e}")
                 return False
         return True
+
+
 
     def create_default_icon(self):
         """Create a default icon programmatically if no icon file exists"""
@@ -176,27 +188,63 @@ class DirectSearchApplication:
         self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 3000)
 
     def handle_show_overlay(self):
-        """Show the capture overlay with lazy loading"""
-        print("[DEBUG] 🎯 Activating overlay with lazy loading...")
+        """Show the capture overlay with lazy loading and immediate OCR trigger"""
+        print("[DEBUG] 🎯 Activating overlay with lazy loading and OCR prep...")
         try:
-            # Lazy load components first
+            # 1. Lazy load components first
             if not self.lazy_load_components():
                 self.show_notification("Error", "Failed to load application components")
                 return
-                
+            
+            # 2. Capture full screen image immediately (blocking but necessary for background)
+            full_image = self.search_engine.capture_full_screen()
+            if not full_image:
+                self.show_notification("Error", "Failed to capture screen.")
+                return
+            
+            # 3. Load captured image and geometry into overlay
+            self.overlay.load_full_screen_capture(full_image)
+            
+            # 4. Show the overlay (User sees the screen and wait cursor/loading state)
             self.overlay.show_overlay()
-            print("[DEBUG] Overlay activated")
+            
+            # 5. Start background OCR process on the full image
+            self.search_engine.start_full_screen_ocr(full_image) 
+            
+            print("[DEBUG] Overlay activated and OCR worker started.")
+            
         except Exception as e:
             print(f"[ERROR] Failed to show overlay: {e}")
             self.show_notification("Error", "Failed to show overlay")
 
+
     def on_region_selected(self, rect):
-        """Handle region selection with direct search"""
-        print(f"[DEBUG] Region selected: {rect}")
+        """Handle region selection for Image Search"""
+        print(f"[DEBUG] Region selected (Image Search Mode): {rect}")
         if self.search_engine:
             self.search_engine.process_selection(rect)
         else:
             print("[ERROR] Search engine not initialized")
+            
+    def on_text_search_copy(self, text):
+        """Handle text search and copy request from the overlay menu"""
+        print(f"[DEBUG] Text selected: Copy & Search: {text[:40]}...")
+        if self.search_engine:
+            # Engine handles both copy and search execution
+            self.search_engine.search_text_and_copy(text)
+        else:
+            self.show_notification("Error", "Search engine not ready.")
+            
+    def on_text_copy(self, text):
+        """Handle text copy only request from the overlay menu"""
+        print(f"[DEBUG] Text selected: Copy Only: {text[:40]}...")
+        try:
+            pyperclip.copy(text.strip())
+            self.show_notification("Copied", f"'{text.strip()[:50]}...' copied to clipboard.")
+        except Exception as e:
+            print(f"[WARNING] Could not copy text: {e}")
+            self.show_notification("Error", "Failed to copy text.")
+
 
     def cleanup_and_exit(self):
         """Cleanup and exit application"""
@@ -252,37 +300,186 @@ if __name__ == "__main__":
     main()
 
 
-
 ================================================
 FILE: overlay.py
 ================================================
-from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QRect, QPoint, Signal
-from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtWidgets import QWidget, QToolButton, QHBoxLayout, QFrame
+from PySide6.QtCore import Qt, QRect, QPoint, Signal, QSize, QMargins
+from PySide6.QtGui import QPainter, QColor, QPen, QGuiApplication, QPixmap, QCursor, QFont
+import enum
+from PIL.ImageQt import ImageQt
+
+class OverlayMode(enum.Enum):
+    LOADING = 0
+    TEXT_SELECTION = 1
+    REGION_SELECTION = 2
+
+class TextActionWidget(QFrame):
+    """Small widget for showing text actions"""
+    search_triggered = Signal(str)
+    copy_triggered = Signal(str)
+
+    def __init__(self, selected_text: str):
+        super().__init__()
+        self.selected_text = selected_text
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.Popup)
+        self.setStyleSheet("QFrame { background-color: #333; border: 1px solid #00F; border-radius: 5px; padding: 5px; }")
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(10)
+
+        # Search Button (Copy & Search)
+        search_btn = QToolButton(self)
+        search_btn.setText("🔍 Copy & Search")
+        search_btn.setStyleSheet("QToolButton { background-color: #0078D4; color: white; border-radius: 3px; padding: 5px 10px; } QToolButton:hover { background-color: #005A9E; }")
+        search_btn.clicked.connect(lambda: self.search_triggered.emit(self.selected_text))
+
+        # Copy Button
+        copy_btn = QToolButton(self)
+        copy_btn.setText("📋 Copy Text")
+        copy_btn.setStyleSheet("QToolButton { background-color: #555; color: white; border-radius: 3px; padding: 5px 10px; } QToolButton:hover { background-color: #777; }")
+        copy_btn.clicked.connect(lambda: self.copy_triggered.emit(self.selected_text))
+        
+        layout.addWidget(search_btn)
+        layout.addWidget(copy_btn)
+        
+        self.adjustSize()
 
 class OverlayWindow(QWidget):
-    region_selected = Signal(QRect)
+    region_selected = Signal(QRect) 
+    text_copied_and_searched = Signal(str)
+    text_copied = Signal(str)
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint |
             Qt.WindowStaysOnTopHint |
-            Qt.Tool
+            Qt.Tool |
+            Qt.Popup 
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_DeleteOnClose)
 
+        self.mode = OverlayMode.LOADING
+        
+        self.full_screen_pixmap = None
+        self.ocr_results = [] 
+        
+        # Region selection state
         self.begin_pos = QPoint()
         self.end_pos = QPoint()
-        self.is_selecting = False
+        self.is_selecting_region = False
 
-    def show_overlay(self):
-        """Shows the simplified overlay across all screens."""
+        # Text selection state
+        self.hovered_ocr_index = -1
+        self.selected_ocr_index = -1
+        self.is_selecting_text = False
+        self.selected_text_content = ""
+        
+        self.mode_button = self._setup_mode_button()
+        self.action_widget = None
+
+    def _setup_mode_button(self):
+        """Setup the button to switch modes"""
+        btn = QToolButton(self)
+        btn.setStyleSheet("""
+            QToolButton { 
+                background-color: #4CAF50; color: white; border-radius: 5px; 
+                padding: 8px 15px; font-weight: bold; 
+                border: 2px solid #388E3C;
+            }
+            QToolButton:hover { 
+                background-color: #66BB6A; 
+            }
+        """)
+        btn.setVisible(False)
+        btn.clicked.connect(self.toggle_mode)
+        return btn
+    
+    def set_mode(self, new_mode: OverlayMode):
+        """Switch the overlay mode"""
+        self.mode = new_mode
+        self.is_selecting_region = False
+        self.selected_ocr_index = -1
+        self.cleanup_action_widget() # Ensure floating widget is closed
+
+        if new_mode == OverlayMode.TEXT_SELECTION:
+            print("[DEBUG] Switched to TEXT SELECTION Mode.")
+            self.mode_button.setText("📷 Switch to Image Search Area")
+            self.mode_button.setVisible(True)
+            self.setCursor(Qt.IBeamCursor)
+        elif new_mode == OverlayMode.REGION_SELECTION:
+            print("[DEBUG] Switched to REGION SELECTION Mode.")
+            self.mode_button.setText("📝 Switch to Text Selection Mode")
+            self.mode_button.setVisible(True)
+            self.setCursor(Qt.CrossCursor)
+        elif new_mode == OverlayMode.LOADING:
+            self.mode_button.setVisible(False)
+            self.setCursor(Qt.WaitCursor)
+            
+        self.update_mode_button_position()
+        self.update()
+
+    def toggle_mode(self):
+        """Handler for switching modes"""
+        if self.mode == OverlayMode.REGION_SELECTION:
+            self.set_mode(OverlayMode.TEXT_SELECTION)
+        elif self.mode == OverlayMode.TEXT_SELECTION:
+            self.set_mode(OverlayMode.REGION_SELECTION)
+
+    def update_mode_button_position(self):
+        """Center the mode button at the top"""
+        if self.mode_button.isVisible():
+            button_size = self.mode_button.sizeHint()
+            x = (self.width() - button_size.width()) // 2
+            y = 10 
+            self.mode_button.move(x, y)
+
+    def load_full_screen_capture(self, pil_image):
+        """Load the background image and set geometry."""
+        from PIL.ImageQt import ImageQt
+        
+        # 1. Convert PIL image to QImage/QPixmap
+        qimage = ImageQt(pil_image)
+        native_pixmap = QPixmap.fromImage(qimage)
+        
         desktop_geometry = self.get_desktop_geometry()
         self.setGeometry(desktop_geometry)
+        
+        # 2. Scale the native pixmap down to the logical geometry size
+        # This handles the DPI difference and prevents magnification.
+        # We use SmoothTransformation for quality resizing.
+        logical_width = desktop_geometry.width()
+        logical_height = desktop_geometry.height()
+        
+        self.full_screen_pixmap = native_pixmap.scaled(
+            logical_width, 
+            logical_height, 
+            Qt.KeepAspectRatioByExpanding, 
+            Qt.SmoothTransformation
+        )
+        
+        # Start in loading state, wait for OCR results
+        self.set_mode(OverlayMode.LOADING)  
+        
+    def load_ocr_results(self, results: list):
+        """Load OCR results and switch mode based on success"""
+        self.ocr_results = results
+        if results:
+            self.set_mode(OverlayMode.TEXT_SELECTION)
+        else:
+            # Fallback if OCR found nothing
+            self.set_mode(OverlayMode.REGION_SELECTION)
+        self.update()
+
+    def show_overlay(self):
+        """Shows the overlay across all screens."""
+        if not self.full_screen_pixmap: return
         self.showFullScreen()
         self.activateWindow()
+        self.update_mode_button_position()
 
     def get_desktop_geometry(self) -> QRect:
         """Calculates the bounding box of all connected screens."""
@@ -292,53 +489,175 @@ class OverlayWindow(QWidget):
         return total_geometry
 
     def paintEvent(self, event):
-        """A much simpler paint event for debugging."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # 1. Draw a semi-transparent black overlay over the entire screen area.
-        overlay_color = QColor(0, 0, 0, 80)
-        painter.fillRect(self.rect(), overlay_color)
+        # 1. Draw the captured full screen image as the background
+        if self.full_screen_pixmap:
+            painter.drawPixmap(self.rect().topLeft(), self.full_screen_pixmap)
+        
+        if self.mode == OverlayMode.LOADING:
+            # Draw a heavy dark overlay while waiting for OCR
+            overlay_color = QColor(0, 0, 0, 150)
+            painter.fillRect(self.rect(), overlay_color)
+            return
 
-        # 2. If selecting, draw a border for the selection rectangle.
-        if self.is_selecting:
-            selection_rect = QRect(self.begin_pos, self.end_pos).normalized()
-            
-            # Draw a clear rectangle inside the selection
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.fillRect(selection_rect, Qt.transparent)
-            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        if self.mode == OverlayMode.TEXT_SELECTION:
+            # 2a. Draw slight dark overlay to make highlights pop
+            overlay_color = QColor(0, 0, 0, 80)
+            painter.fillRect(self.rect(), overlay_color)
 
-            # Draw a white border around it
-            pen = QPen(QColor("#FFFFFF"), 2, Qt.SolidLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(selection_rect)
+            # Draw OCR bounding boxes and selection/hover feedback
+            for i, item in enumerate(self.ocr_results):
+                x, y, w, h = item['rect']
+                rect = QRect(x, y, w, h)
+                
+                # Draw hover feedback
+                if i == self.hovered_ocr_index:
+                    painter.setBrush(QColor(255, 255, 255, 60))
+                    painter.setPen(Qt.NoPen)
+                    painter.drawRect(rect)
+                
+                # Draw selection feedback
+                if i == self.selected_ocr_index:
+                    painter.setBrush(QColor(0, 120, 215, 120)) # Blue highlight
+                    painter.setPen(Qt.NoPen)
+                    painter.drawRect(rect)
 
+        elif self.mode == OverlayMode.REGION_SELECTION:
+            # 2b. Draw semi-transparent overlay AND the selection rectangle (old logic)
+            overlay_color = QColor(0, 0, 0, 80)
+            painter.fillRect(self.rect(), overlay_color)
+
+            if self.is_selecting_region:
+                selection_rect = QRect(self.begin_pos, self.end_pos).normalized()
+                
+                # Draw a clear rectangle inside the selection
+                painter.setCompositionMode(QPainter.CompositionMode_Clear)
+                painter.fillRect(selection_rect, Qt.transparent)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+                # Draw a white border around it
+                pen = QPen(QColor("#FFFFFF"), 2, Qt.SolidLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(selection_rect)
+
+    # --- Mouse Handlers ---
     def mousePressEvent(self, event):
-        self.is_selecting = True
-        self.begin_pos = event.position().toPoint()
-        self.end_pos = self.begin_pos
-        self.update()
-
-    def mouseMoveEvent(self, event):
-        if self.is_selecting:
-            self.end_pos = event.position().toPoint()
+        self.cleanup_action_widget()
+        
+        if self.mode == OverlayMode.REGION_SELECTION:
+            self.is_selecting_region = True
+            self.begin_pos = event.position().toPoint()
+            self.end_pos = self.begin_pos
+            self.update()
+        elif self.mode == OverlayMode.TEXT_SELECTION:
+            # Start text selection
+            self.is_selecting_text = True
+            self.selected_ocr_index = self.hovered_ocr_index
             self.update()
 
+    def mouseMoveEvent(self, event):
+        mouse_pos = event.position().toPoint()
+        
+        if self.mode == OverlayMode.REGION_SELECTION and self.is_selecting_region:
+            self.end_pos = mouse_pos
+            self.update()
+            
+        elif self.mode == OverlayMode.TEXT_SELECTION:
+            # Handle hover feedback
+            new_hover_index = self._get_ocr_index_at_point(mouse_pos)
+            if new_hover_index != self.hovered_ocr_index:
+                self.hovered_ocr_index = new_hover_index
+                self.update()
+
+    def _get_ocr_index_at_point(self, point: QPoint):
+        """Find the index of the OCR result bounding box containing the point"""
+        for i, item in enumerate(self.ocr_results):
+            x, y, w, h = item['rect']
+            rect = QRect(x, y, w, h)
+            if rect.contains(point):
+                return i
+        return -1
+
     def mouseReleaseEvent(self, event):
-        if self.is_selecting:
-            self.is_selecting = False
+        if self.mode == OverlayMode.REGION_SELECTION and self.is_selecting_region:
+            self.is_selecting_region = False
             selection_rect = QRect(self.begin_pos, self.end_pos).normalized()
-            self.hide()
+            self.cleanup_and_hide()
             
             if selection_rect.width() > 5 and selection_rect.height() > 5:
-                self.region_selected.emit(selection_rect)
+                self.region_selected.emit(selection_rect) # Trigger Image Search
+            
+        elif self.mode == OverlayMode.TEXT_SELECTION and self.is_selecting_text:
+            self.is_selecting_text = False
+            
+            if self.selected_ocr_index != -1:
+                item = self.ocr_results[self.selected_ocr_index]
+                self.selected_text_content = item['text']
+                
+                # Show action widget near the selection
+                x, y, w, h = item['rect']
+                selected_rect = QRect(x, y, w, h)
+                self._show_text_action_widget(selected_rect)
+            else:
+                 # If user clicked empty space, deselect
+                 self.update()
+
+
+    def _show_text_action_widget(self, selection_rect: QRect):
+        """Show the floating widget with Search/Copy options"""
+        self.cleanup_action_widget()
+            
+        self.action_widget = TextActionWidget(self.selected_text_content)
+        self.action_widget.search_triggered.connect(self._handle_text_search_copy)
+        self.action_widget.copy_triggered.connect(self._handle_text_copy)
+        
+        # Position widget just below the selected text
+        widget_x = selection_rect.left()
+        widget_y = selection_rect.bottom() + 5
+        
+        # Adjust position if too close to the screen edge
+        if widget_x + self.action_widget.width() > self.width():
+            widget_x = self.width() - self.action_widget.width() - 10
+        if widget_y + self.action_widget.height() > self.height():
+             # If too low, put it above the text
+            widget_y = selection_rect.top() - self.action_widget.height() - 5
+            
+        self.action_widget.move(widget_x, widget_y)
+        self.action_widget.show()
+        
+    def cleanup_action_widget(self):
+        if self.action_widget:
+            self.action_widget.close()
+            self.action_widget = None
+
+    def _handle_text_search_copy(self, text):
+        self.text_copied_and_searched.emit(text)
+        self.cleanup_and_hide()
+
+    def _handle_text_copy(self, text):
+        self.text_copied.emit(text)
+        self.cleanup_and_hide()
+
+    def cleanup_and_hide(self):
+        """Hides overlay and cleans temporary state"""
+        self.cleanup_action_widget()
+        self.hide()
+        self.selected_ocr_index = -1
+        self.hovered_ocr_index = -1
+        self.is_selecting_text = False
+        self.is_selecting_region = False
+        self.setCursor(Qt.ArrowCursor) 
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.is_selecting = False
-            self.hide()
+            self.cleanup_and_hide()
+        
+        # Toggle modes with M key
+        elif event.key() == Qt.Key_M and self.mode != OverlayMode.LOADING:
+            self.toggle_mode()
 
 
 ================================================
@@ -393,27 +712,55 @@ import webbrowser
 import mss
 from urllib.parse import quote_plus
 from PIL import Image
-from PySide6.QtCore import QRect, QThread, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QRect, QThread, Signal, QObject 
+from PySide6.QtGui import QGuiApplication, QScreen
 
 from core.ocr_processor import OCRProcessor
 from core.image_search import DirectImageSearchHandler
 
 class SearchWorker(QThread):
-    """Worker thread for processing search operations"""
+    """Worker thread for processing search operations, including initial OCR"""
     finished = Signal(bool, str)
+    ocr_results_ready = Signal(list) 
     
-    def __init__(self, search_engine, rect, image=None, text=None):
+    def __init__(self, search_engine, rect=None, image=None, text=None, full_ocr_task=False):
         super().__init__()
         self.search_engine = search_engine
         self.rect = rect
         self.image = image
         self.text = text
+        self.full_ocr_task = full_ocr_task
 
     def run(self):
         """Run search operation in thread"""
         try:
-            if self.text:
+            if self.full_ocr_task:
+                self.search_engine._initialize_ocr()
+                results = self.search_engine.ocr_processor.extract_text(self.image)
+                
+                # Apply scaling factor correction to results
+                # Coordinates must be converted from native pixels (where OCR ran) to logical pixels (where Qt draws the overlay)
+                screen = QGuiApplication.primaryScreen()
+                pixel_ratio = screen.devicePixelRatio()
+                
+                scaled_results = []
+                if pixel_ratio > 1.0:
+                    for item in results:
+                        x, y, w, h = item['rect']
+                        item['rect'] = (
+                            int(x / pixel_ratio), 
+                            int(y / pixel_ratio), 
+                            int(w / pixel_ratio), 
+                            int(h / pixel_ratio)
+                        )
+                        scaled_results.append(item)
+                else:
+                    scaled_results = results
+                    
+                self.ocr_results_ready.emit(scaled_results)
+                self.finished.emit(True, "Full screen OCR completed.")
+                
+            elif self.text:
                 success = self.search_engine.search_text(self.text)
                 self.finished.emit(success, f"Text search: {self.text[:30]}...")
             elif self.image:
@@ -425,12 +772,15 @@ class SearchWorker(QThread):
             print(f"[ERROR] Search worker error: {e}")
             self.finished.emit(False, f"Error: {str(e)}")
 
-class DirectSearchEngine:
+class DirectSearchEngine(QObject):
     """Main search engine handling both text and direct image search"""
     
+    ocr_results_available = Signal(list) # Signal to main app
+
     def __init__(self):
-        self.ocr_processor = None  # Lazy initialization
-        self.image_handler = None  # Lazy initialization
+        super().__init__()
+        self.ocr_processor = None
+        self.image_handler = None
         self.current_worker = None
 
     def _initialize_ocr(self):
@@ -443,17 +793,45 @@ class DirectSearchEngine:
         if self.image_handler is None:
             self.image_handler = DirectImageSearchHandler()
 
-    def capture_region(self, rect: QRect):
-        """Capture screen region and return PIL Image"""
+    def capture_full_screen(self):
+        """Capture the entire screen area at native resolution."""
         try:
+            # Calculate the total bounding box in logical coordinates
+            total_geometry = QRect()
+            for screen in QGuiApplication.screens():
+                total_geometry = total_geometry.united(screen.geometry())
+            
+            # mss requires logical coordinates when capturing the entire desktop
+            capture_rect = {
+                "top": total_geometry.top(),
+                "left": total_geometry.left(),
+                "width": total_geometry.width(),
+                "height": total_geometry.height(),
+            }
+            
+            with mss.mss() as sct:
+                # mss automatically handles DPI scaling to capture native pixels based on the logical rect
+                sct_img = sct.grab(capture_rect)
+                pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                return pil_img
+                
+        except Exception as e:
+            print(f"[ERROR] Full screen capture failed: {e}")
+            return None
+
+    def capture_region(self, rect: QRect):
+        """Capture screen region based on QRect (used for Image Search)"""
+        try:
+            # We must use the primary screen's ratio for scaling the logical QRect input
             screen = QGuiApplication.primaryScreen()
             pixel_ratio = screen.devicePixelRatio()
             
+            # The input QRect is already in logical pixels, mss requires a logical rect
             capture_rect = {
-                "top": int(rect.top() * pixel_ratio),
-                "left": int(rect.left() * pixel_ratio),
-                "width": int(rect.width() * pixel_ratio),
-                "height": int(rect.height() * pixel_ratio),
+                "top": rect.top(),
+                "left": rect.left(),
+                "width": rect.width(),
+                "height": rect.height(),
             }
             
             with mss.mss() as sct:
@@ -465,56 +843,48 @@ class DirectSearchEngine:
             print(f"[ERROR] Screen capture failed: {e}")
             return None
 
-    def process_selection(self, rect: QRect):
-        """Process selected region for search"""
-        print("[INFO] Processing selected region...")
+    def start_full_screen_ocr(self, captured_image):
+        """Starts the initial OCR process on the full captured image."""
+        if self.current_worker and self.current_worker.isRunning():
+            self.current_worker.quit()
+            self.current_worker.wait()
+            
+        print("[INFO] Starting full screen OCR worker...")
+        self.current_worker = SearchWorker(self, image=captured_image, full_ocr_task=True)
+        self.current_worker.ocr_results_ready.connect(self._on_full_ocr_complete)
+        self.current_worker.finished.connect(lambda s, m: print(f"[INFO] OCR Worker Status: {m}"))
+        self.current_worker.start()
+
+    def _on_full_ocr_complete(self, results):
+        """Handle full screen OCR completion"""
+        print(f"[INFO] Initial OCR returned {len(results)} items.")
+        self.ocr_results_available.emit(results)
         
-        # Capture image
+    def process_selection(self, rect: QRect):
+        """Process selected region for direct image search (Region Mode)"""
+        print("[INFO] Processing selected region for Image Search...")
+        
         captured_image = self.capture_region(rect)
         if not captured_image:
             print("[ERROR] Failed to capture region")
             return
 
-        # Initialize OCR only when needed
-        self._initialize_ocr()
-        
-        # Perform OCR
-        ocr_text = self.ocr_processor.extract_text(captured_image)
-        
-        # Auto-copy text to clipboard
-        if ocr_text.strip():
-            try:
-                pyperclip.copy(ocr_text.strip())
-                print("[INFO] Text copied to clipboard")
-            except Exception as e:
-                print(f"[WARNING] Could not copy text: {e}")
+        self._initialize_image_handler()
+        self._start_search_worker(rect, image=captured_image)
 
-        # Determine search type and execute
-        if ocr_text.strip():
-            print(f"[INFO] 🔍 Performing text search: {ocr_text[:40]}...")
-            self._start_search_worker(rect, text=ocr_text.strip())
-        else:
-            print("[INFO] 🚀 Performing direct image search...")
-            # Initialize image handler only when needed
-            self._initialize_image_handler()
-            self._start_search_worker(rect, image=captured_image)
 
-    def _start_search_worker(self, rect, image=None, text=None):
-        """Start search in worker thread"""
-        if self.current_worker and self.current_worker.isRunning():
-            self.current_worker.quit()
-            self.current_worker.wait()
+    def search_text_and_copy(self, query):
+        """Copy text and perform Google search (used by Overlay menu)"""
+        if not query.strip():
+            return False
             
-        self.current_worker = SearchWorker(self, rect, image, text)
-        self.current_worker.finished.connect(self._on_search_complete)
-        self.current_worker.start()
-
-    def _on_search_complete(self, success, message):
-        """Handle search completion"""
-        if success:
-            print(f"✅ {message} completed successfully!")
-        else:
-            print(f"❌ {message} failed")
+        try:
+            pyperclip.copy(query.strip())
+            print("[INFO] Text copied to clipboard")
+        except Exception as e:
+            print(f"[WARNING] Could not copy text: {e}")
+            
+        return self.search_text(query)
 
     def search_text(self, query):
         """Search text with Google"""
@@ -540,14 +910,33 @@ class DirectSearchEngine:
         else:
             print("[WARNING] No image provided for reverse search")
             return False
+            
+    def _start_search_worker(self, rect, image=None, text=None):
+        """Start search in worker thread"""
+        if self.current_worker and self.current_worker.isRunning() and not self.current_worker.full_ocr_task:
+            self.current_worker.quit()
+            self.current_worker.wait()
+            
+        if self.current_worker and self.current_worker.full_ocr_task and self.current_worker.isRunning():
+             # If a new search request comes in while OCR is running, we stop the OCR thread
+             self.current_worker.quit()
+             self.current_worker.wait()
+            
+        self.current_worker = SearchWorker(self, rect, image, text)
+        self.current_worker.finished.connect(self._on_search_complete)
+        self.current_worker.start()
+
+    def _on_search_complete(self, success, message):
+        """Handle search completion"""
+        if success:
+            print(f"✅ {message} completed successfully!")
+        else:
+            print(f"❌ {message} failed")
 
     def cleanup(self):
         """Cleanup resources and free memory - ONLY on app exit"""
         if self.ocr_processor:
             self.ocr_processor.cleanup()
-        # Don't cleanup image_handler here - let browser stay open
-        # if self.image_handler:
-        #     self.image_handler.cleanup()
         if self.current_worker and self.current_worker.isRunning():
             self.current_worker.quit()
             self.current_worker.wait()
@@ -616,8 +1005,8 @@ class DirectImageSearchHandler:
             return self._fallback_image_search(pil_image)
 
         try:
-            print("🌐 Navigating to Google Lens...")
-            self.driver.get("https://lens.google.com")
+            print("🌐 Navigating to Google")
+            self.driver.get("https://google.com")
             
             # Wait for page to load
             time.sleep(2)
@@ -638,90 +1027,13 @@ class DirectImageSearchHandler:
             # 2. Send the file path
             file_input.send_keys(temp_image_path)
             
+            
+            
             # Wait for upload to complete and upload button to appear
             print("⏳ Waiting for upload to complete...")
-            time.sleep(3)
+            time.sleep(5)
             
-            # 3. Look for and click the search button
-            print("🔍 Looking for search button...")
-            
-            # Try multiple possible selectors for the search button
-            search_button_selectors = [
-                # Google Lens specific buttons
-                "button[aria-label*='Search']",
-                "button[jsname*='search']",
-                "button:has(svg)",  # Button with icon
-                "div[role='button'][aria-label*='Search']",
-                "div[jsname*='search']",
-                # Generic button with search text
-                "button:contains('Search')",
-                "button:contains('Search with image')",
-                "button:contains('Search image')",
-                # By class names that might indicate search button
-                "button[class*='search']",
-                "button[class*='submit']",
-                "button[class*='upload']",
-                # Google Images specific
-                "button[aria-label='Search']",
-                "button[data-attrid*='search']",
-            ]
-            
-            search_button = None
-            for selector in search_button_selectors:
-                try:
-                    if "contains" in selector:
-                        # Handle :contains pseudo-selector
-                        text = selector.split("contains('")[1].split("')")[0]
-                        buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                        for btn in buttons:
-                            if text.lower() in btn.text.lower():
-                                search_button = btn
-                                break
-                    else:
-                        search_button = WebDriverWait(self.driver, 5).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                        )
-                    
-                    if search_button:
-                        print(f"✅ Found search button with selector: {selector}")
-                        break
-                except:
-                    continue
-            
-            if not search_button:
-                # Try finding by XPath as fallback
-                try:
-                    search_button = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.XPATH, 
-                            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'search')] | "
-                            "//div[@role='button' and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'search')]"
-                        ))
-                    )
-                except:
-                    pass
-            
-            if search_button:
-                print("🎯 Clicking search button automatically...")
-                try:
-                    # Try clicking with JavaScript if normal click fails
-                    self.driver.execute_script("arguments[0].click();", search_button)
-                    print("✅ Search button clicked via JavaScript")
-                except Exception as e:
-                    print(f"⚠️ JavaScript click failed: {e}")
-                    try:
-                        search_button.click()
-                        print("✅ Search button clicked normally")
-                    except Exception as e2:
-                        print(f"⚠️ Normal click also failed: {e2}")
-            else:
-                print("⚠️ Could not find search button, trying to trigger search with Enter key...")
-                # Try pressing Enter key as fallback
-                from selenium.webdriver.common.keys import Keys
-                file_input.send_keys(Keys.ENTER)
-                print("✅ Sent Enter key to trigger search")
-            
-            # Wait for search to complete
-            time.sleep(2)
+           
             
             # --- Wait for Results ---
             
@@ -729,7 +1041,7 @@ class DirectImageSearchHandler:
             print("⏳ Waiting for search results (URL change to /lens/search)...")
             
             WebDriverWait(self.driver, 30).until(
-                EC.url_contains('/lens/search')
+                EC.url_contains('/search')
             )
             
             # Now wait briefly for the content structure to confirm full page load
@@ -915,40 +1227,59 @@ class OCRProcessor:
             print("[INFO] EasyOCR Reader initialized.")
     
     def extract_text(self, pil_image: Image.Image):
-        """Extract text from PIL Image using OCR"""
+        """Extract text from PIL Image using OCR. Returns list of structured results."""
         self._initialize_reader()
         
         try:
             # Convert to numpy array
             image_np = numpy.array(pil_image)
             
-            # Perform OCR with confidence threshold
+            # Perform OCR (Result: list of [bbox (4 points), text (str), conf (float)])
             result = self.reader.readtext(image_np)
             
-            # Filter results by confidence
-            recognized_texts = [text for bbox, text, conf in result if conf > 0.3]
-            full_text = "\n".join(recognized_texts)
-            
-            print(f"[INFO] OCR extracted {len(recognized_texts)} text elements")
+            filtered_results = []
+            for bbox, text, conf in result:
+                if conf > 0.3:
+                    # Bounding box is typically [[x1,y1], [x2,y2], [x3,y3], [x4,y4]].
+                    # We approximate it as a simple QRect-compatible format: (x, y, w, h)
+                    x_coords = [p[0] for p in bbox]
+                    y_coords = [p[1] for p in bbox]
+                    x_min = int(min(x_coords))
+                    y_min = int(min(y_coords))
+                    x_max = int(max(x_coords))
+                    y_max = int(max(y_coords))
+                    
+                    filtered_results.append({
+                        'text': text,
+                        # Store rect as (x, y, w, h) tuple
+                        'rect': (x_min, y_min, x_max - x_min, y_max - y_min), 
+                        'conf': conf
+                    })
+
+            print(f"[INFO] OCR extracted {len(filtered_results)} text elements")
             
             # Clear large variables
             del image_np
-            del result
             
-            return full_text
+            # We must adjust coordinates based on the system's device pixel ratio,
+            # especially if the image was captured at native resolution.
+            # Assuming the image passed here is the native full screen capture.
+            
+            return filtered_results
             
         except Exception as e:
             print(f"[ERROR] OCR processing failed: {e}")
-            return ""
+            return []
     
     def cleanup(self):
         """Cleanup OCR reader to free memory"""
         if self.reader:
             try:
+                # Deliberately try to clean up memory used by the model
                 del self.reader
                 self.reader = None
                 print("[INFO] OCR reader cleaned up")
-            except:
+            except Exception:
                 pass
 
 

@@ -4,6 +4,7 @@ import atexit
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter
 from PySide6.QtCore import QLockFile, QDir, Qt, QPoint
+import pyperclip # Needed here for copy-only action
 
 class DirectSearchApplication:
     """Main application controller with system tray"""
@@ -51,12 +52,23 @@ class DirectSearchApplication:
                 self.overlay = OverlayWindow()
                 
                 # Connect signals
+                # 1. Region selection (Image Search Mode)
                 self.overlay.region_selected.connect(self.on_region_selected)
+                
+                # 2. Text Selection Actions (New)
+                self.overlay.text_copied_and_searched.connect(self.on_text_search_copy)
+                self.overlay.text_copied.connect(self.on_text_copy) 
+
+                # 3. OCR results from Engine back to Overlay
+                self.search_engine.ocr_results_available.connect(self.overlay.load_ocr_results)
+                
                 print("[DEBUG] Core components loaded successfully")
             except Exception as e:
                 print(f"[ERROR] Failed to load core components: {e}")
                 return False
         return True
+
+
 
     def create_default_icon(self):
         """Create a default icon programmatically if no icon file exists"""
@@ -158,27 +170,63 @@ class DirectSearchApplication:
         self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 3000)
 
     def handle_show_overlay(self):
-        """Show the capture overlay with lazy loading"""
-        print("[DEBUG] 🎯 Activating overlay with lazy loading...")
+        """Show the capture overlay with lazy loading and immediate OCR trigger"""
+        print("[DEBUG] 🎯 Activating overlay with lazy loading and OCR prep...")
         try:
-            # Lazy load components first
+            # 1. Lazy load components first
             if not self.lazy_load_components():
                 self.show_notification("Error", "Failed to load application components")
                 return
-                
+            
+            # 2. Capture full screen image immediately (blocking but necessary for background)
+            full_image = self.search_engine.capture_full_screen()
+            if not full_image:
+                self.show_notification("Error", "Failed to capture screen.")
+                return
+            
+            # 3. Load captured image and geometry into overlay
+            self.overlay.load_full_screen_capture(full_image)
+            
+            # 4. Show the overlay (User sees the screen and wait cursor/loading state)
             self.overlay.show_overlay()
-            print("[DEBUG] Overlay activated")
+            
+            # 5. Start background OCR process on the full image
+            self.search_engine.start_full_screen_ocr(full_image) 
+            
+            print("[DEBUG] Overlay activated and OCR worker started.")
+            
         except Exception as e:
             print(f"[ERROR] Failed to show overlay: {e}")
             self.show_notification("Error", "Failed to show overlay")
 
+
     def on_region_selected(self, rect):
-        """Handle region selection with direct search"""
-        print(f"[DEBUG] Region selected: {rect}")
+        """Handle region selection for Image Search"""
+        print(f"[DEBUG] Region selected (Image Search Mode): {rect}")
         if self.search_engine:
             self.search_engine.process_selection(rect)
         else:
             print("[ERROR] Search engine not initialized")
+            
+    def on_text_search_copy(self, text):
+        """Handle text search and copy request from the overlay menu"""
+        print(f"[DEBUG] Text selected: Copy & Search: {text[:40]}...")
+        if self.search_engine:
+            # Engine handles both copy and search execution
+            self.search_engine.search_text_and_copy(text)
+        else:
+            self.show_notification("Error", "Search engine not ready.")
+            
+    def on_text_copy(self, text):
+        """Handle text copy only request from the overlay menu"""
+        print(f"[DEBUG] Text selected: Copy Only: {text[:40]}...")
+        try:
+            pyperclip.copy(text.strip())
+            self.show_notification("Copied", f"'{text.strip()[:50]}...' copied to clipboard.")
+        except Exception as e:
+            print(f"[WARNING] Could not copy text: {e}")
+            self.show_notification("Error", "Failed to copy text.")
+
 
     def cleanup_and_exit(self):
         """Cleanup and exit application"""
