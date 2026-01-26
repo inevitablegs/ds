@@ -109,11 +109,13 @@ class DirectSearchEngine(QObject):
     def capture_region(self, rect: QRect):
         """Capture screen region based on QRect (used for Image Search)"""
         try:
-            # Find which screen contains the selection point
+            # Find which screen contains the center of the selection
             target_screen = None
+            center_point = rect.center()
+            
             for screen in QGuiApplication.screens():
                 screen_geometry = screen.geometry()
-                if screen_geometry.contains(rect.center()):
+                if screen_geometry.contains(center_point):
                     target_screen = screen
                     break
             
@@ -124,27 +126,50 @@ class DirectSearchEngine(QObject):
             # Get the screen's DPI ratio
             pixel_ratio = target_screen.devicePixelRatio()
             
-            # Calculate screen-relative coordinates
+            # The input rect is in logical coordinates (same as overlay)
+            # We need to convert it to screen-specific coordinates
             screen_geometry = target_screen.geometry()
-            screen_relative_rect = QRect(
+            
+            # Calculate screen-relative coordinates in LOGICAL pixels
+            screen_relative_logical = QRect(
                 rect.x() - screen_geometry.x(),
                 rect.y() - screen_geometry.y(),
                 rect.width(),
                 rect.height()
             )
             
-            # mss requires screen-specific coordinates
+            # Convert logical coordinates to PHYSICAL coordinates for mss
+            # mss expects physical pixels, so multiply by DPI ratio
             capture_rect = {
-                "top": screen_relative_rect.top(),
-                "left": screen_relative_rect.left(),
-                "width": screen_relative_rect.width(),
-                "height": screen_relative_rect.height(),
-                "mon": self._get_screen_index(target_screen)
+                "top": int(screen_relative_logical.top() * pixel_ratio),
+                "left": int(screen_relative_logical.left() * pixel_ratio),
+                "width": int(screen_relative_logical.width() * pixel_ratio),
+                "height": int(screen_relative_logical.height() * pixel_ratio),
             }
             
+            print(f"[DEBUG] Capture rect - Logical: {screen_relative_logical}, Physical: {capture_rect}, DPI: {pixel_ratio}")
+            
             with mss.mss() as sct:
+                # Get monitor index for this screen
+                monitors = sct.monitors
+                monitor_index = 1  # Default to primary monitor
+                
+                # Find the correct monitor based on screen position
+                for i in range(1, len(monitors)):  # Skip monitor 0 (all screens)
+                    monitor = monitors[i]
+                    # Check if this monitor matches our target screen's position
+                    if (abs(monitor["left"] - screen_geometry.x() * pixel_ratio) < 10 and 
+                        abs(monitor["top"] - screen_geometry.y() * pixel_ratio) < 10):
+                        monitor_index = i
+                        break
+                
+                # Add monitor number to capture rect
+                capture_rect["mon"] = monitor_index
+                
                 sct_img = sct.grab(capture_rect)
                 pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                
+                print(f"[DEBUG] Captured image size: {pil_img.size}")
                 return pil_img
                 
         except Exception as e:
@@ -178,7 +203,8 @@ class DirectSearchEngine(QObject):
         
     def process_selection(self, rect: QRect):
         """Process selected region for direct image search (Region Mode)"""
-        print("[INFO] Processing selected region for Image Search...")
+        print(f"[DEBUG] Processing selection at: {rect}")
+        print(f"[DEBUG] Screen info: {self.get_screen_info()}")
         
         captured_image = self.capture_region(rect)
         if not captured_image:
@@ -188,6 +214,21 @@ class DirectSearchEngine(QObject):
         self._initialize_image_handler()
         self._start_search_worker(rect, image=captured_image)
 
+    def get_screen_info(self):
+        """Get information about all screens for debugging"""
+        screens = QGuiApplication.screens()
+        info = []
+        for i, screen in enumerate(screens):
+            geometry = screen.geometry()
+            info.append({
+                'index': i,
+                'name': screen.name(),
+                'geometry': (geometry.x(), geometry.y(), geometry.width(), geometry.height()),
+                'dpi': screen.devicePixelRatio(),
+                'logical_dpi': screen.logicalDotsPerInch(),
+                'physical_dpi': screen.physicalDotsPerInch()
+            })
+        return info
 
     def search_text_and_copy(self, query):
         """Copy text and perform Google search (used by Overlay menu)"""

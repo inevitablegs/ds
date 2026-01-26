@@ -136,21 +136,34 @@ class OverlayWindow(QWidget):
         """Load the background image and set geometry."""
         from PIL.ImageQt import ImageQt
         
-        # 1. Convert PIL image to QImage/QPixmap
-        qimage = ImageQt(pil_image)
-        
-        # Get the actual screen geometry (logical pixels)
+        # 1. Get the screen geometry (logical pixels)
         desktop_geometry = self.get_desktop_geometry()
         self.setGeometry(desktop_geometry)
         
-        # 2. Create pixmap from the native image WITHOUT scaling
-        self.full_screen_pixmap = QPixmap.fromImage(qimage)
+        # 2. Convert PIL image to QPixmap
+        qimage = ImageQt(pil_image)
+        native_pixmap = QPixmap.fromImage(qimage)
         
-        # 3. Instead of scaling, we need to handle DPI/scale factor differently
-        # The pixmap should be at native resolution, Qt will handle scaling
+        # 3. Get primary screen's DPI ratio to understand the scale
+        primary_screen = QGuiApplication.primaryScreen()
+        pixel_ratio = primary_screen.devicePixelRatio()
+        
+        print(f"[DEBUG] Screen geometry: {desktop_geometry}, Image size: {pil_image.size}, DPI: {pixel_ratio}")
+        
+        # 4. Scale the pixmap to match logical screen size
+        # The captured image is in physical pixels, we need to scale down to logical pixels
+        logical_width = desktop_geometry.width()
+        logical_height = desktop_geometry.height()
+        
+        self.full_screen_pixmap = native_pixmap.scaled(
+            logical_width, 
+            logical_height, 
+            Qt.KeepAspectRatio,  # Changed from KeepAspectRatioByExpanding
+            Qt.SmoothTransformation
+        )
         
         # Start in loading state, wait for OCR results
-        self.set_mode(OverlayMode.LOADING)   
+        self.set_mode(OverlayMode.LOADING)     
         
     def load_ocr_results(self, results: list):
         """Load OCR results and switch mode based on success"""
@@ -182,14 +195,11 @@ class OverlayWindow(QWidget):
 
         # 1. Draw the captured full screen image as the background
         if self.full_screen_pixmap:
-            # Scale the pixmap to fit the widget size
-            scaled_pixmap = self.full_screen_pixmap.scaled(
-                self.size(), 
-                Qt.KeepAspectRatioByExpanding, 
-                Qt.SmoothTransformation
-            )
-            painter.drawPixmap(self.rect(), scaled_pixmap)
-        
+            # Calculate centered position
+            x = (self.width() - self.full_screen_pixmap.width()) // 2
+            y = (self.height() - self.full_screen_pixmap.height()) // 2
+            painter.drawPixmap(x, y, self.full_screen_pixmap)
+            
         if self.mode == OverlayMode.LOADING:
             # Draw a heavy dark overlay while waiting for OCR
             overlay_color = QColor(0, 0, 0, 150)
