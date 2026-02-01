@@ -84,7 +84,7 @@ class DirectImageSearchHandler:
             
             # Wait for upload to complete and upload button to appear
             print("⏳ Waiting for upload to complete...")
-            time.sleep(5)
+            time.sleep(2)
             
            
             
